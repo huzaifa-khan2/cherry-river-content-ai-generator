@@ -92,7 +92,7 @@ export default function GenerateVideo() {
       pollRef.current = setInterval(async () => {
         try {
           const wmParam = wmTaskIdRef.current ? `?wm=${wmTaskIdRef.current}` : ''
-          const statusRes = await fetch(`${API_URL}/api/video-status/${taskIdRef.current}${wmParam}`)
+          const statusRes = await apiFetch(`${API_URL}/api/video-status/${taskIdRef.current}${wmParam}`)
           const statusData = await statusRes.json()
           setGenerationStatus(statusData.status)
           // Track WM task ID so next poll includes it

@@ -2332,6 +2332,8 @@ const videoRatioMap = {
 
 // POST /api/generate-video — start Seedance 2 video generation via PiAPI
 app.post("/api/generate-video", async (req, res) => {
+  const userId = await getUserId(req)
+  if (!userId) return res.status(401).json({ error: "Unauthorized" })
   try {
     const { productId, customPrompt, duration, format } = req.body;
     if (!productId) return res.status(400).json({ error: "productId is required" });
@@ -2390,6 +2392,8 @@ app.post("/api/generate-video", async (req, res) => {
 
 // GET /api/video-status/:id — poll Seedance 2 video status via PiAPI
 app.get("/api/video-status/:id", async (req, res) => {
+  const userId = await getUserId(req)
+  if (!userId) return res.status(401).json({ error: "Unauthorized" })
   try {
     const taskId = req.params.id;
     const filename = `${taskId}.mp4`;
