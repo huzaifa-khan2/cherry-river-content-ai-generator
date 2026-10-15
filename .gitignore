@@ -45,3 +45,8 @@ walkthrough-frames/
 *.png
 !public/**
 !src/**
+
+# local one-off generation scripts (keep out of the public push)
+generate-gin-lemon-*.mjs
+stitch-gin-lemon.mjs
+CHERRY_RIVER_AI_MEMORY.md

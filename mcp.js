@@ -8,6 +8,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import { createClient } from "@supabase/supabase-js";
+import { timingSafeEqual } from "crypto";
 
 const MCP_SECRET = process.env.MCP_SECRET;
 const MCP_USER_EMAIL = process.env.MCP_USER_EMAIL;
@@ -36,11 +37,14 @@ async function getAccessToken() {
   return cachedToken;
 }
 
-function baseUrl(req) {
-  if (process.env.PUBLIC_BASE_URL) return process.env.PUBLIC_BASE_URL.replace(/\/$/, "");
-  const proto = req.headers["x-forwarded-proto"] || "https";
-  const host = req.headers["x-forwarded-host"] || req.headers.host;
-  return `${proto}://${host}`;
+// Deliberately does NOT fall back to x-forwarded-host/x-forwarded-proto: those are
+// client-supplied headers, and this function's result is used as the target of an
+// outbound fetch carrying a real Bearer token — trusting them would let a caller
+// redirect that authenticated request (and the token) to an attacker-controlled host.
+function baseUrl(_req) {
+  const base = process.env.PUBLIC_BASE_URL;
+  if (!base) throw new Error("PUBLIC_BASE_URL must be set to use MCP tools");
+  return base.replace(/\/$/, "");
 }
 
 async function apiCall(req, method, path, body) {
@@ -145,11 +149,20 @@ function buildServer(req) {
   return server;
 }
 
+// Constant-time compare, length-checked first (timingSafeEqual throws on mismatched
+// lengths rather than returning false).
+function secretMatches(candidate) {
+  if (typeof candidate !== "string" || candidate.length !== MCP_SECRET.length) return false;
+  return timingSafeEqual(Buffer.from(candidate), Buffer.from(MCP_SECRET));
+}
+
 export function mountMcp(app) {
   if (!MCP_SECRET) { console.warn("[mcp] MCP_SECRET not set - /api/mcp disabled"); return; }
   app.post("/api/mcp", async (req, res) => {
-    const key = req.query.key || req.headers["x-mcp-secret"];
-    if (key !== MCP_SECRET) {
+    // Header only — never the query string, which ends up in server access logs,
+    // proxy logs, and the Referer header of any outbound request from this page.
+    const key = req.headers["x-mcp-secret"];
+    if (!secretMatches(key)) {
       return res.status(401).json({ jsonrpc: "2.0", error: { code: -32001, message: "Unauthorized" }, id: null });
     }
     try {

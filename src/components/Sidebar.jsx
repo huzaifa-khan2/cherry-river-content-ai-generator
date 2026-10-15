@@ -1,5 +1,5 @@
 import { NavLink } from 'react-router-dom'
-import { LayoutDashboard, Image, Video, Layers, Grid3X3, FolderOpen, Settings, LogOut } from 'lucide-react'
+import { LayoutDashboard, Image, Video, Layers, Sparkles, Grid3X3, FolderOpen, Settings, LogOut } from 'lucide-react'
 import { useAuth } from '../contexts/AuthContext'
 
 const navItems = [
@@ -7,6 +7,7 @@ const navItems = [
   { to: '/generate-image', icon: Image, label: 'Generate Image' },
   { to: '/generate-video', icon: Video, label: 'Generate Video' },
   { to: '/concept-studio', icon: Layers, label: 'Concept Studio' },
+  { to: '/brand-concepts', icon: Sparkles, label: 'Brand Concepts' },
   { to: '/products', icon: Grid3X3, label: 'Products' },
   { to: '/gallery', icon: FolderOpen, label: 'Gallery' },
 ]

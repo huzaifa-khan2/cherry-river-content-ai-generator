@@ -7,6 +7,7 @@ import Dashboard from './pages/Dashboard'
 import GenerateImage from './pages/GenerateImage'
 import GenerateVideo from './pages/GenerateVideo'
 import ConceptStudio from './pages/ConceptStudio'
+import BrandConcepts from './pages/BrandConcepts'
 import Products from './pages/Products'
 import Gallery from './pages/Gallery'
 
@@ -36,6 +37,7 @@ function AppRoutes() {
         <Route path="generate-image" element={<GenerateImage />} />
         <Route path="generate-video" element={<GenerateVideo />} />
         <Route path="concept-studio" element={<ConceptStudio />} />
+        <Route path="brand-concepts" element={<BrandConcepts />} />
         <Route path="products" element={<Products />} />
         <Route path="gallery" element={<Gallery />} />
       </Route>

@@ -1,11 +1,12 @@
 import { NavLink } from 'react-router-dom'
-import { LayoutDashboard, Image, Video, Layers, Grid3X3, FolderOpen } from 'lucide-react'
+import { LayoutDashboard, Image, Video, Layers, Sparkles, Grid3X3, FolderOpen } from 'lucide-react'
 
 const navItems = [
   { to: '/', icon: LayoutDashboard, label: 'Home' },
   { to: '/generate-image', icon: Image, label: 'Image' },
   { to: '/generate-video', icon: Video, label: 'Video' },
   { to: '/concept-studio', icon: Layers, label: 'Studio' },
+  { to: '/brand-concepts', icon: Sparkles, label: 'Brand' },
   { to: '/products', icon: Grid3X3, label: 'Products' },
   { to: '/gallery', icon: FolderOpen, label: 'Gallery' },
 ]

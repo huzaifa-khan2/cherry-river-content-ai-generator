@@ -46,6 +46,48 @@ const upload = multer({
 const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN });
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
+// Image generation engine — Sep 2026 upgrade from Flux 2 Pro to OpenAI's GPT-Image-2.5
+// (via Replicate, not OpenAI's own API — see reference_gpt_image_2_5_replicate memory for why).
+// "flux" kept reachable (not deleted) as a fallback, not currently used by any call site.
+const IMAGE_MODEL_SLUGS = {
+  flare: "openai/gpt-image-2.5-flare",       // fast/everyday — default for single-reference, simple scenes
+  sunburst: "openai/gpt-image-2.5-sunburst", // precise/high-control — harder composited or multi-reference scenes
+  flux: "black-forest-labs/flux-2-pro",
+};
+
+// GPT-Image-2.5 only accepts a fixed aspect_ratio enum (confirmed via a live 422) — unlike Flux,
+// which took any "W:H" string. "4:5" (this app's portrait can/bottle format) isn't in that enum;
+// "3:4" is the closest supported ratio (0.75 vs 4:5's 0.8).
+const OPENAI_ASPECT_RATIOS = new Set(["1:1", "3:2", "2:3", "4:3", "3:4", "16:9", "9:16"]);
+function normalizeAspectRatioForOpenAI(aspectRatio) {
+  if (OPENAI_ASPECT_RATIOS.has(aspectRatio)) return aspectRatio;
+  if (aspectRatio === "4:5") return "3:4";
+  if (aspectRatio === "5:4") return "4:3";
+  return "1:1";
+}
+
+// Normalizes the different input schemas between GPT-Image-2.5 (openai/*) and Flux 2 Pro,
+// and always returns an array of delivery URLs (length 1 unless `n` > 1).
+async function runImageModel({ prompt, inputImages = [], aspectRatio = "1:1", n = 1, model = "flare" }) {
+  const slug = IMAGE_MODEL_SLUGS[model] || IMAGE_MODEL_SLUGS.flare;
+  const input = slug.startsWith("openai/")
+    ? { prompt, input_images: inputImages, aspect_ratio: normalizeAspectRatioForOpenAI(aspectRatio), number_of_images: n, quality: "high", output_format: "png" }
+    : {
+        prompt,
+        resolution: "4 MP",
+        aspect_ratio: aspectRatio,
+        output_format: "png",
+        output_quality: 100,
+        safety_tolerance: 5,
+        guidance: 3,
+        prompt_upsampling: true,
+        ...(inputImages.length ? { input_images: inputImages } : {}),
+      };
+  const output = await replicate.run(slug, { input });
+  const outputs = Array.isArray(output) ? output : [output];
+  return outputs.map((o) => (o && typeof o.url === "function" ? o.url() : String(o)));
+}
+
 // Upload image buffer to Supabase Storage, return public URL
 async function uploadToStorage(buffer, mimetype, filename) {
   const { data, error } = await supabase.storage
@@ -65,10 +107,40 @@ async function saveGeneratedImage(url, filename) {
   return uploadToStorage(buffer, mimetype, `generated/${filename}`);
 }
 
+// Averse's plain Vodka Premium is genuinely clear/colorless — only the flavored line (Framboise,
+// Mangue, Pomme) actually has a tinted liquid. Nothing in the prompt constrained liquid color before,
+// so the model was free to invent one (e.g. a red tint near the base, likely pulled from the "CHERRY"
+// wordmark) — flagged as a real bug found in a fresh generation. This pins the correct color per flavor.
+function getAverseLiquidDescriptor(productName) {
+  const n = (productName || "").toLowerCase();
+  if (n.includes("framboise")) return "a deep red/pink raspberry-tinted vodka";
+  if (n.includes("mangue")) return "a warm orange/amber mango-tinted vodka";
+  if (n.includes("pomme")) return "a pale green apple-tinted vodka";
+  return "genuinely clear, colorless vodka — never tinted red, amber, or any other color, including near the base";
+}
+
+// Averse's dome-shaped base/foot is its OWN opaque, solid-colored section (confirmed against real
+// product photos, Sep 25 2026 — a lineup shot shows the base as a solid gray/white, orange, magenta,
+// or green dome depending on flavor, never clear glass). Flagged as a real bug: the mid-body clear-glass
+// fix (see hasTransparentGlass) had been over-applied all the way to the base, making the whole lower
+// bottle read as see-through when only the mid-body should be — the base itself must stay opaque.
+function getAverseDomeColor(productName) {
+  const n = (productName || "").toLowerCase();
+  if (n.includes("pomme") || n.includes("apple")) return "apple green";
+  if (n.includes("framboise") || n.includes("raspberry")) return "deep crimson red";
+  if (n.includes("mangue") || n.includes("mango")) return "warm amber orange";
+  if (n.includes("limonade")) return "lemon yellow";
+  if (n.includes("basilic") || n.includes("petits fruits")) return "mauve purple";
+  if (n.includes("gin") || n.includes("london")) return "midnight navy";
+  return "white";
+}
+
 // Enhance prompt using Claude — with vision if product image available
 async function enhancePrompt(userPrompt, product) {
   const isCan = product?.product_type === "can";
   const isAverse = product?.name?.toLowerCase().includes("averse");
+  const averseLiquid = isAverse ? getAverseLiquidDescriptor(product?.name) : "";
+  const averseDome = isAverse ? getAverseDomeColor(product?.name) : "";
   const userContent = [];
 
   // Attach product image so Claude sees exact label, colors, shape
@@ -89,7 +161,7 @@ async function enhancePrompt(userPrompt, product) {
   userContent.push({
     type: "text",
     text: `You are a world-class product photography director for premium beverage brands.
-Study the product image carefully — memorize the exact ${isCan ? "can shape, label colors, design, pull-tab" : isAverse ? "frosted matte bottle shape, colored dome base cap, label design — this bottle has NO cork" : "bottle shape, glass color, label design, cork"}.
+Study the product image carefully — memorize the exact ${isCan ? "can shape, label colors, design, pull-tab" : isAverse ? `frosted matte bottle shape, colored dome base cap, label design — this bottle has NO cork. CRITICAL, this bottle has exactly THREE zones, never confuse them: (1) the very top neck/shoulder section carrying the 'a|v|e|r|s|e' logo is frosted matte opaque white; (2) the mid-body — starting right at the 'VODKA SUPÉRIEURE PREMIUM' text and continuing down to where the bottle's rounded/flared foot begins — is genuinely CLEAR, TRANSPARENT glass: the 'VODKA SUPÉRIEURE PREMIUM' text sits directly on the clear glass (not on a white backing), so the bottle's vertical ribbed/faceted glass texture and the liquid inside are visible right through that text band too, not just further down. This mid-body zone must NEVER be described or rendered as frosted, opaque, or solid-colored — it is real see-through glass, always. IGNORE the flat white/bright studio-lighting cast visible on the reference photo's own lower glass section — that is a lighting artifact from how the catalog photo was shot, not a property of the glass itself. In the new scene, the clear mid-body glass must show genuine optical refraction of THIS scene's actual background/environment and lighting, never a plain white or milky haze copied from the reference photo. The liquid inside is ${averseLiquid} — do not invent any other liquid color. (3) the dome-shaped base/foot at the very bottom is its OWN separate, OPAQUE, solid ${averseDome}-colored section — NEVER clear or transparent glass, and it must NOT show the liquid or scene background through it, exactly like a real Averse bottle's base. CRITICAL, this dome is NARROWER than the bottle's own body — only about two-thirds of the bottle's width — sitting centered at the very bottom, with a visible margin of clear see-through glass wrapping around its left and right sides (the dome never touches or spans all the way to the bottle's outer glass walls on both sides at once; real reference photos confirm this narrower, inset dome shape, never a flat wide block filling the entire base width). The 'CHERRY RIVER' text printed on that solid ${averseDome} dome, AND the '40% ALC. / VOL. 750 ml' declaration line printed directly below it, are BOTH BLACK, not white or gray, sitting on the opaque ${averseDome} surface (not on glass)` : "bottle shape, glass color, label design, cork"}.
 Enhance this prompt into a VIP professional photography brief. Keep it under 120 words.
 Return ONLY the enhanced prompt, nothing else — no explanations, no labels.
 
@@ -98,9 +170,11 @@ User prompt: ${userPrompt}
 
 Rules:
 - Describe THIS exact product from the image — specific colors, label details, bottle/can shape
+- CRITICAL: any text or illustration actually printed on the product's real label must be reproduced verbatim from the reference photo — copy the exact wording and exact graphic/illustration style, never invent, reword, paraphrase, translate differently, or restyle any part of it (e.g. never turn a lace/vein-only illustration into a solid filled one, never make up new French/English copy that isn't on the real label)
 - Keep the user's core scene/idea
 - Add: exact product positioning, lighting details, camera settings (f-stop, depth of field), mood, photographic style
 ${isCan ? "- CRITICAL for cans: the can must be shown PERFECTLY UPRIGHT, standing vertically at 90 degrees, never tilted or angled. Label text must be fully readable and undistorted. Can is planted firmly on the surface, not floating." : ""}
+${isAverse ? `- CRITICAL, always include this regardless of the user's own prompt wording: explicitly state that the top neck/shoulder 'a|v|e|r|s|e' logo band is opaque frosted white, that starting from the 'VODKA SUPÉRIEURE PREMIUM' text downward the MID-BODY only (down to where the bottle's foot/base begins) is clear, transparent, see-through glass — the 'VODKA SUPÉRIEURE PREMIUM' text sits directly on clear glass with the ribbed glass texture and liquid visible through it, not on a white background — this is a hard requirement, never omit it even if the user's prompt doesn't mention glass at all. Also explicitly state that this mid-body clear glass must show real refraction of THIS scene's own background and lighting (e.g. dark bar tones in a bar scene, warm daylight in an outdoor scene) — never a flat white, milky, or bright studio-highlight cast that ignores the scene around it. Explicitly state the liquid itself is ${averseLiquid} — never a different color. Then explicitly state that the dome-shaped base/foot at the very bottom is a SEPARATE, OPAQUE, solid ${averseDome}-colored section — never clear glass, never showing the liquid or scene through it — and that this dome is NARROWER than the bottle's body (about two-thirds of its width), centered at the very bottom with a visible margin of clear see-through glass wrapping around both its left and right sides, never spanning the bottle's full width or touching both outer glass walls at once. It carries the 'CHERRY RIVER' text and the '40% ALC. / VOL. 750 ml' line directly below it, both in solid black (not white or gray), sitting on that opaque ${averseDome} surface, unlike the white wordmark higher up on the bottle.` : ""}
 - End with: "professional beverage advertising photography"`,
   });
 
@@ -444,11 +518,27 @@ async function hasVisibleText(imageUrl) {
   return answer.startsWith("YES");
 }
 
-const MAX_CONCEPT_ATTEMPTS = 3;
+const MAX_CONCEPT_ATTEMPTS = 5;
+
+// referenceImageUrl/productImageUrl are user-supplied and get fetched server-side
+// (getDominantColor/getFlatSilhouette) or handed to Replicate directly — without this check
+// a caller could point either at an internal/private address (SSRF). Only our own Supabase
+// storage ever legitimately produces these URLs, so restrict to that host.
+function isTrustedImageUrl(url) {
+  try {
+    const u = new URL(url);
+    if (u.protocol !== "https:") return false;
+    return u.hostname === new URL(process.env.SUPABASE_URL).hostname;
+  } catch {
+    return false;
+  }
+}
 
 async function generateConceptMockup({ flavorName, colorHex, format, sceneId, customScene, finish, mood, exampleId, capColor, liquidVisibility, referenceImageUrl, productImageUrl, customPrompt, userId, userEmail }) {
   const shapeDescriptor = conceptShapeDescriptors[format];
   if (!shapeDescriptor) throw new Error("Invalid format");
+  if (referenceImageUrl && !isTrustedImageUrl(referenceImageUrl)) throw new Error("Invalid reference image URL");
+  if (productImageUrl && !isTrustedImageUrl(productImageUrl)) throw new Error("Invalid product image URL");
 
   let sceneText;
   if (customScene && customScene.trim()) {
@@ -514,34 +604,28 @@ async function generateConceptMockup({ flavorName, colorHex, format, sceneId, cu
     referenceMode,
   });
 
-  const inputPayload = {
-    prompt: enhancedPrompt,
-    resolution: "4 MP",
-    // Cans/bottles are tall & slim — a square canvas forces Flux to squash the real proportions
-    // to fit the frame. Portrait 4:5 gives the subject room to render at its true aspect ratio.
-    aspect_ratio: "4:5",
-    output_format: "png",
-    output_quality: 100,
-    safety_tolerance: 5,
-    guidance: 3,
-    prompt_upsampling: true,
-  };
-  if (shapeReferenceUrl) {
-    // "shape" mode references a REAL product photo (or generic stand-in) — strip its printed
-    // content before Flux sees it. "consistency" mode references our OWN previously-generated
-    // (already blank-label) board tile, so there's no real label to leak — skip processing.
-    inputPayload.input_images = [
-      referenceMode === "shape" ? await getFlatSilhouette(shapeReferenceUrl) : shapeReferenceUrl,
-    ];
-  }
+  // "shape" mode references a REAL product photo (or generic stand-in) — strip its printed
+  // content before the model sees it. "consistency" mode references our OWN previously-generated
+  // (already blank-label) board tile, so there's no real label to leak — skip processing.
+  const inputImages = shapeReferenceUrl
+    ? [referenceMode === "shape" ? await getFlatSilhouette(shapeReferenceUrl) : shapeReferenceUrl]
+    : [];
 
   // Generate, then verify with a vision check before trusting the output — retry on failure
   // rather than risk shipping a mockup with hallucinated text (see hasVisibleText comment above).
+  // Sunburst (not Flare) — this path leans on precise reference-image conditioning to keep the
+  // label genuinely blank, which is exactly Sunburst's "high-control editing" strength.
   let replicateUrl, attempts = 0, textDetected = true;
   while (attempts < MAX_CONCEPT_ATTEMPTS) {
     attempts++;
-    const output = await replicate.run("black-forest-labs/flux-2-pro", { input: inputPayload });
-    replicateUrl = output.url ? output.url() : String(output);
+    [replicateUrl] = await runImageModel({
+      prompt: enhancedPrompt,
+      inputImages,
+      // Cans/bottles are tall & slim — a square canvas forces the model to squash the real
+      // proportions to fit the frame. Portrait 4:5 gives the subject room to render true.
+      aspectRatio: "4:5",
+      model: "sunburst",
+    });
     textDetected = await hasVisibleText(replicateUrl);
     if (!textDetected) break;
     console.warn(`Concept mockup attempt ${attempts}/${MAX_CONCEPT_ATTEMPTS} for "${flavorName}" showed visible text/lettering — retrying...`);
@@ -576,6 +660,404 @@ async function generateConceptMockup({ flavorName, colorHex, format, sceneId, cu
 
   return { image, enhancedPrompt, savedGeneration, effectiveColorHex };
 }
+
+// --- Part B: Real-logo brand concept generator (Sep 2026) ---
+// Kept fully separate from generateConceptMockup above rather than a branch inside it — the
+// prompt rule here is the INVERSE of the blank-label rule (apply the real logo faithfully,
+// never blank it), so sharing one function would mean threading a flag through every line of
+// that rule instead of just writing the opposite one. Francis explicitly asked (Sep 12 2026,
+// see project memory) to reverse the June 24 blank-label spec for this one flow only —
+// Generate Image / Concept Studio's blank-label discipline is untouched.
+//
+// Needs the `brands` table (see drafts/2026-09-13-brands-table.sql — not yet run) and a real
+// logo image per brand (not yet supplied by Francis) before this can produce a real result.
+
+async function getBrand(brandId) {
+  const { data, error } = await supabase.from("brands").select("*").eq("id", brandId).maybeSingle();
+  if (error || !data) throw new Error("Unknown brand — pick a brand first.");
+  if (!data.logo_url) throw new Error(`No logo on file for "${data.name}" yet — this brand needs a real logo image uploaded before concepts can be generated.`);
+  return data;
+}
+
+// One clean, unambiguous real can per known real archetype, instead of dumping every
+// real can in as a reference. This brand's 24 real cans actually span several visually
+// CONTRADICTORY treatments (matte-black-band body vs. full-color-gradient body; 3
+// different top/bottom pattern styles: minimal-geometric, fruit-icon-wrap, line-art-
+// silhouette) — feeding all of them at once gives the model 20+ conflicting examples to
+// average across, diluting exactly the "pick ONE style" decision the prompt asks it to
+// make. A handful of curated exemplars — one clean real photo per archetype — gives it
+// an unambiguous real example of each option instead, without losing real-family
+// grounding (still real photos, not invented) or falling back to only 1-2 images (which
+// reintroduces the earlier "model invents an unrelated design" failure mode).
+const curatedCanExemplars = {
+  "Cherry River": [
+    "CR Amaretto Sour 355mL", // style (a): minimal geometric top/bottom border
+    "CR Vodka Limonade 355mL", // style (b): fruit-icon wrap, top+bottom bands
+    "CR Sangria Rouge 355mL", // style (c): line-art silhouette + full-gradient body
+    "CR Mocktail Paloma SA 355mL", // SANS ALCOOL / mocktail metallic-bar formula
+    "CR Margarita 355mL", // dot+triangle border variant, tribal-spike typography, 3-line category tag, faint tonal line-art inside the bottom block
+  ],
+};
+
+async function getBrandCanReferenceImages(brandId, brandName) {
+  const { data } = await supabase.from("products").select("name, image").eq("brand_id", brandId).eq("product_type", "can").not("image", "is", null);
+  // Six-pack/collection box shots share product_type "can" with individual cans (no separate
+  // type in the DB — confirmed via direct query, e.g. Cherry River's "CR Mixologie 6-Pack SA"
+  // rows), but they're multi-can box photography, not a single can's label design — feeding them
+  // in teaches the model the wrong structure entirely. Filter them out by name.
+  const realCans = (data || []).filter((p) => p.image && !/6-pack/i.test(p.name || ""));
+  const curatedNames = curatedCanExemplars[brandName];
+  if (curatedNames) {
+    const curated = curatedNames
+      .map((name) => realCans.find((p) => p.name === name))
+      .filter(Boolean)
+      .map((p) => p.image);
+    // Only use the curated subset if every named exemplar was actually found (product
+    // renamed/deleted otherwise silently shrinks the reference set) — fall back to the
+    // full real set rather than risk missing a style archetype entirely.
+    if (curated.length === curatedNames.length) return curated;
+  }
+  return realCans.map((p) => p.image);
+}
+
+// Inverse of hasVisibleText above: here the brand's real wordmark SHOULD appear, so the
+// safety net checks for the opposite failure — blank, garbled, or wrong-brand lettering.
+async function hasCorrectLogo(imageUrl, brandName) {
+  const imgRes = await fetch(imageUrl);
+  const buf = Buffer.from(await imgRes.arrayBuffer());
+  const base64 = buf.toString("base64");
+  const message = await anthropic.messages.create({
+    model: "claude-opus-4-6",
+    max_tokens: 10,
+    messages: [{
+      role: "user",
+      content: [
+        { type: "image", source: { type: "base64", media_type: "image/png", data: base64 } },
+        { type: "text", text: `Look at the label/logo area on this can or bottle. Does it clearly show a real, legible "${brandName}" brand wordmark or logo — not blank, not garbled/gibberish lettering, not a different or invented brand name? Answer with exactly one word: YES or NO.` },
+      ],
+    }],
+  });
+  return (message.content[0].text || "").trim().toUpperCase().startsWith("YES");
+}
+
+// Cherry River's real BOTTLE identity is NOT one unified system — confirmed against 5 real
+// photos (Dry Gin, Gin Framboise & Lime, Gin Litchi & Tangerine, Rhum Ambré, Tequila Silver,
+// Vodka Érable) it varies distinctly by spirit category in shape, cap, body treatment, AND
+// label structure. The can-only style_notes (audited separately from 27 real cans, see the
+// Sep 15 brand.style_notes update) do NOT apply to bottles — "Don't bottle it!" and the
+// black-body-with-red-accent system never appear on a single real CR bottle, only cans.
+const cherryRiverBottleStyleNotesByCategory = {
+  gin: `Real Cherry River Gin bottles: an apothecary-style bottle (wide rounded shoulders, short neck) with a WOOD-GRAIN cap over a visible cork stopper. The bottle is genuinely CLEAR glass and the gin's own real color tints the entire visible liquid/glass (e.g. rose-pink for a raspberry gin, warm amber-orange for a citrus gin) — never opaque or solid-colored. A faint, tone-on-tone (barely darker than the liquid tint) illustrated wrap covers the whole visible glass body: mountains, pine trees, a leaping animal, and flavor-relevant fruit line-art, drawn as delicate engraved/etched linework, subtle enough to read as texture rather than a bold graphic. A circular quality stamp reading "PRODUIT ÉLABORÉ AU QUÉBEC — PRODUCT BLENDED IN QUÉBEC" sits on the clear glass near the shoulder. ONE rectangular label patch with a deliberately torn/deckle top-and-bottom edge, colored in the flavor's accent color, holds: "CHERRY RIVER" in the bold stacked slab-serif wordmark, "GIN" beneath it, then the bilingual flavor name (French/English) beneath that. Near the base, small text directly on the glass shows "40% alc./vol." and "750 ml" plus a tiny GPS-coordinate-style line and a barcode. NO "Don't bottle it!" tagline anywhere — that phrase is exclusive to the can line, never a bottle.`,
+  rhum: `Real Cherry River Rhum bottles: a rounded-shoulder cylindrical bottle with a WOOD-GRAIN cap over a visible cork stopper. The upper half is clear glass showing the rum's own real amber/dark liquid color through it, with the "CHERRY RIVER" wordmark rendered as bold outlined/pinstripe-style lettering directly on the clear glass (a faint mirrored/reversed decorative text may show through from behind, as subtle texture only). The lower half is a solid OPAQUE BLACK band holding: "RHUM" in bold white caps, the flavor word in a smaller white italic cursive script beneath it, then the English equivalent in the same bold-caps/cursive pairing (e.g. "RHUM" / "ambré" / "amber" / "RUM"), and "40% alc./vol. | 750 mL" beneath that. NO illustration wrap, NO torn label patch, NO "Don't bottle it!" tagline.`,
+  tequila: `Real Cherry River Tequila bottles: a distinctive wide-based pyramid/decanter-shaped bottle (broad tapering body narrowing to the shoulder) with a WOOD-GRAIN cap over a visible cork stopper. "CHERRY RIVER" appears embossed/pressed directly into the clear glass near the shoulder (subtle, same color as the glass, barely visible). The lower two-thirds is a FROSTED WHITE/translucent band holding: a fine line-art illustration of an agave plant, the "CHERRY RIVER" wordmark directly beneath it, then "TEQUILA" in bold caps with the variant name in a lighter weight beneath, "FAIT AU MEXIQUE / MADE IN MEXICO" in small caps, and "750mL" / "40% alc./vol." in the bottom corners. NO nature-scene illustration wrap, NO torn label patch, NO "Don't bottle it!" tagline.
+  FLAVOR-SPECIFIC COLOR VARIATION (this is the one thing that changes between tequila flavors, otherwise every new flavor looks identical to plain Silver, which is wrong): the real "Silver" variant uses teal/blue as its accent (agave line-art + wordmark + variant-name text), but a NEW flavored variant must shift this ONE accent color to genuinely match its flavor character — e.g. a chili/pepper flavor uses a warm chili-red accent, a citrus flavor uses a lime-green accent, a berry flavor uses a deep berry-pink/red accent — recolor the agave line-art, "CHERRY RIVER" wordmark, and variant-name text together in that new flavor-matched hue (keep them all the same new color, don't mix). If the flavor plausibly tints the spirit itself (e.g. a fruit-infused tequila), the liquid visible through the clear glass may also carry a faint matching tint — a plain/unflavored variant stays clear. Do not skip this step: reusing the exact same teal/blue Silver coloring for a differently-named flavor is a real, recurring failure.`,
+  vodka: `Real Cherry River Vodka bottles: a tall cylindrical wine-bottle-style silhouette with a plain BLACK screw cap (not wood, unlike this brand's other spirits). The upper body is a solid MATTE BLACK opaque coating with a gold-foil maple-leaf illustration and the "CHERRY RIVER" wordmark in pale blue-gray beneath it. CRITICAL, that maple leaf is a SKELETONIZED/vein-only foil illustration, like a lace botanical engraving: only the leaf's veins and outline are solid gold, the space between the veins is negative/see-through, revealing the dark bottle body behind it — it is NEVER a solid, fully-filled gold leaf silhouette (a common, confirmed-wrong generation). The lower band is a cream/tan color with a repeated tone-on-tone pattern of that SAME skeletonized-leaf motif (like a subtle wallpaper print, not solid leaves), holding "VODKA" and the flavor name (e.g. "ÉRABLE") plus a small bilingual description line — for the maple/"Érable" flavor this line is EXACTLY "VODKA AROMATISÉE À L'ÉRABLE" / "MAPLE FLAVOURED VODKA", copied verbatim, never invented or reworded (a confirmed-wrong generation produced garbled invented French here, e.g. "AU-AAROME NATUREL D'ÉRABLE" — that exact phrasing is wrong and must never be used). Near the base, a rounded gold dome-shaped zone carries the specs ("41% alc./vol." and "750 ml"). NO nature-scene illustration wrap, NO torn label patch, NO wood cap, NO "Don't bottle it!" tagline.`,
+};
+
+function getCherryRiverBottleCategory(flavorName) {
+  const n = flavorName.toLowerCase();
+  if (n.includes("gin")) return "gin";
+  if (n.includes("rhum") || n.includes("rum")) return "rhum";
+  if (n.includes("tequila")) return "tequila";
+  if (n.includes("vodka")) return "vodka";
+  return null;
+}
+
+// One real photo per category — the generic conceptShapeReferenceImages.bottle750 (Dry Gin)
+// is the right shape ONLY for gin; Rhum/Tequila/Vodka have their own distinct real bottle
+// shapes (rounded cylinder, pyramid decanter, wine-bottle silhouette respectively).
+const cherryRiverBottleShapeReferenceImages = {
+  gin: "https://bypedtyxtnmmdsyrgwpj.supabase.co/storage/v1/object/public/product-images/product-1776357898479.jpg", // Cherry River Dry Gin 750mL
+  rhum: "https://bypedtyxtnmmdsyrgwpj.supabase.co/storage/v1/object/public/product-images/product-1776357911053.jpg", // CR Rhum Ambré 750mL
+  tequila: "https://bypedtyxtnmmdsyrgwpj.supabase.co/storage/v1/object/public/product-images/product-1776357913761.jpg", // CR Tequila Silver 750mL
+  vodka: "https://bypedtyxtnmmdsyrgwpj.supabase.co/storage/v1/object/public/product-images/product-1776357915165.jpg", // CR Vodka Érable 750mL
+};
+
+async function enhanceBrandConceptPrompt({ flavorName, brandName, styleNotes, shapeDescriptor, designFeedback, realCanReferenceCount = 0, hasParentBrandLogo = false, strictStyleNotesOnly = false, includeIconStyleRefs = false }) {
+  const hasRealCanFamily = realCanReferenceCount > 0;
+  const message = await anthropic.messages.create({
+    model: "claude-opus-4-6",
+    max_tokens: 350,
+    messages: [{
+      role: "user",
+      content: `You are a packaging concept designer generating a new flavor concept that must look like a real, market-ready product from the "${brandName}" line.
+
+Product concept: a "${flavorName}" flavor, ${shapeDescriptor}.
+${styleNotes ? `Brand visual identity to follow closely: ${styleNotes}` : ""}
+${hasRealCanFamily
+  ? `${realCanReferenceCount} real reference photos are attached, plus the brand's logo file — each one a DIFFERENT real archetype this brand's actual existing can line uses (not near-duplicates of each other, and not the brand's full catalog). These reference photos are not inspiration — they ARE the brand's real, approved packaging system already on shelves; your job is to pick whichever ONE of these attached archetypes fits this new flavor best, not to blend elements from all of them together.`
+  : `Two real reference images are attached: the brand's actual logo/label design, and a real product photo as a shape/proportion template.`}
+${hasParentBrandLogo ? `\nOne additional small reference image is attached: the real "CHERRY RIVER" parent-brand logo (a separate, distinct wordmark from the main brand's own logo above). This brand is a Cherry River sub-brand, and real bottles in this line carry a small "CHERRY RIVER" credit near the base — render that credit using this exact attached logo image, copied faithfully at small scale, NOT redrawn in a generic or different font. This is a small secondary detail only — it must never replace, resize to match, or visually compete with the main brand's own logo/wordmark, which stays the dominant identity on the bottle.` : ""}
+${includeIconStyleRefs ? `\nTHE LAST TWO ATTACHED IMAGES are tight close-up crops of real fruit/berry icons from this can family, showing ONLY the icon artwork with no can shape or wordmark in view — study these two crops closely, they are the exact flat rendering style your icons must match: completely flat solid-color shapes, no gloss, no gradient, no dimensional shading of any kind, like cut vinyl sticker art. This is more reliable than the text description alone — copy the flatness level shown in these two crops exactly.` : ""}
+
+CRITICAL RULES:
+- Apply the attached brand logo/label design FAITHFULLY and LEGIBLY onto the can/bottle — do not redraw it in a different style, distort it, or invent a different logo/brand name. This is the OPPOSITE of a blank-label concept: the real brand identity must be clearly visible and correctly reproduced.
+- Incorporate the flavor name "${flavorName}" and flavor-appropriate color/imagery around the existing brand identity — never replacing it.
+- Match the shape reference photo's proportions exactly (height-to-diameter ratio, cap, base) — this is a real packaging mockup, not an abstract shape.
+${hasRealCanFamily ? `- REPLICATE THE REAL FAMILY'S EXACT STRUCTURE (most important rule) — study the attached real can photos closely: this real line uses SEVERAL different pattern styles across its flavors, and you must pick whichever ONE fits this new flavor best, copying it precisely rather than defaulting to the same choice every time:
+  (a) Minimal geometric: a thin tribal/zigzag/triangle line pattern in the accent color, only near the top crimp and repeated in a darker tone in the bottom chevron band (e.g. the Tiki, Amaretto Sour style) — a real variant of this same style alternates solid/outlined triangle peaks with a small dot centered above each gap between peaks (the Margarita style); either plain zigzag or triangle+dot is correct, pick whichever reads cleaner at this can's scale.
+  (b) Fruit-icon wrap: clean VECTOR ILLUSTRATION icons across the top band AND bottom chevron band, on a solid accent-color background (the Gin Limonade / Vodka Limonade style) — use this when the flavor is fruit-forward. Icon rule verified directly from the real cans (e.g. the real "Gin Limonade Petits Fruits et Basilic" can shows FOUR distinct icon types — a lime slice, a blackberry, a small red berry, a blueberry — each its own color): use ONE icon type per named ingredient in the flavor (a flavor naming 3 ingredients gets 3 icon types, each in its own true-to-life color, not forced into one hue family). Do not scatter in unrelated ingredients that aren't part of the flavor name, and don't invent more icon types than named ingredients — but DO give every named ingredient its own icon rather than collapsing them into one.
+  BAND HEIGHT + ICON BLEED (a recurring failure point, verified directly against the real cans): the solid-color band itself (top and bottom) must stay SHORT and compact — in the real references it's a narrow strip, clearly less than the height of the icons sitting on it. NEVER make the band taller to fit the icons inside it — that is the single most common mistake and is wrong. Instead, keep the band short and let the large decorative icons BLEED/OVERFLOW past the band's own edge, extending up into the dark can body above (for the top band) or down into the dark body below (for the bottom band) — the icons create the visual height through this overflow, not the band itself. Icons should look layered ON TOP of the boundary between band and dark body, partly inside the color band and partly spilling out over the black area, exactly like the real cans — never fully contained/clipped inside the band's own rectangle. Keep a comfortable gap between the overflowing icons and the main text block (wordmark, flavor name) — they must not touch or crowd the typography.
+  (c) Subtle line-art silhouette: delicate outlined vector illustrations of the flavor's ingredients (fruit slices, leaves) drawn faintly in a barely-darker flat tone directly on the can body itself, behind/around the flavor name, rather than confined to a top/bottom band (the Sangria Rouge style, which also uses a sunburst/ray pattern as its top border instead of zigzag).
+  Pick the ONE style (a, b, or c) that a real designer would choose for this specific flavor's actual ingredients, and execute it precisely — don't blend all three or invent a new one.
+  RENDERING STYLE for icons in (b) and (c): render every icon/illustration as FLAT, CLEAN VECTOR GRAPHIC DESIGN — solid flat fill colors, crisp clean outlines, simple 2D shapes, like a printed sticker/icon set. A little internal linework (segment lines, leaf veins) and at most 2 tones of one hue for gentle shading is fine, matching the real cans (e.g. the real Vodka Limonade lime slice: solid green fill, white segment lines, one thin outline, only very subtle tonal variation). What is NOT allowed: glossy wet highlights, realistic 3D roundness/volume, painterly airbrushed texture, or camera-style depth — anything that makes the icon look like a photograph or a polished 3D render instead of a flat printed graphic. If an icon is coming out looking shiny or dimensional, simplify it toward the plainer end (a flat solid-color shape with minimal internal detail, like the Gin Limonade berries) rather than adding more rendering detail.
+(1) a top band/border in the new accent color using the chosen pattern style, (2) small bilingual category text, ALWAYS in that SAME new accent color (never a fixed gold/amber — the real cans each color this tag to match their own flavor's accent, e.g. red for one flavor, yellow-green for another, coral for another — gold is NOT the rule) — either a 2-line form ("COCKTAIL" / "PRÊT-À-BOIRE") or a 3-line form ("READY-TO-DRINK" / "COCKTAIL" / "PRÊT-À-BOIRE", the Margarita style — English category word, then its French-only line, then the bilingual "PRÊT-À-BOIRE"), pick whichever reads cleaner, (3) the bold white/silver stacked "CHERRY RIVER" wordmark exactly as reference — unchanged, (4) the flavor name in LARGE stacked caps in the new accent color — pick ONE distinctive display treatment per flavor from the real range of styles this brand actually uses (this real line deliberately gives EVERY flavor its own different font mood, never reusing the same one twice): a casual script/cursive, an outline/stroke-only geometric face, a bold serif slab caps, a monospace/typewriter caps, a distressed/grunge slab caps, a thin elegant serif caps, a distressed stamped/rubber-stamp serif, a tribal stencil face (small perpendicular tick/spike accents on the stems of certain letters, e.g. the "TEQUILA MARGARITA" style), or a mixed treatment (bold sans + one cursive accent word + bold sans) — choose whichever mood fits this flavor's character, not the same choice as other recent generations, (5) a bilingual description below the flavor name — either a short 2-line form (French then English, e.g. "COLA CLASSIQUE" / "CLASSIC COLA") or a longer descriptive 2-line ingredient-based tagline (e.g. "BOISSON À BASE DE TEQUILA ET LIME" / "TEQUILA AND LIME BEVERAGE", the Margarita style), both real patterns — pick whichever reads cleaner for this flavor, in bold white ALL-CAPS sans-serif, never joined with a "·" dot, (6) volume/ABV specs near the base in this brand's specific real specs typeface — a clean modern geometric/humanist sans-serif (never a generic bold block font): the numeric values ("355", the "%" figure) in a solid clean weight, the unit abbreviations ("mL" or "ml", "alc./vol.") in a visibly LIGHTER/thinner weight and slightly smaller size than the numbers, separated by a vertical bar "|" with generous spacing on both sides — exactly this two-weight numeral/label contrast, not all-one-weight text, (7) directly above the specs line, this brand's real signature tagline "DON'T BOTTLE IT!" set in a HEAVY-weight, TIGHTLY-TRACKED/condensed geometric sans-serif all-caps — letters kerned close together, almost touching, distinctly bolder and more condensed than the volume/ABV specs line right below it and NOT the same loose, lighter default-weight font used for the bilingual description text elsewhere on the can — a punchy, compact, high-impact display line, NOT decorative/scripted/textured, sitting on its own single line with clear spacing above and below it (a thin short accent-color divider rule above it is a real recurring detail), (8) a bottom diagonal chevron band in the accent color continuing the SAME chosen pattern style from the top (styles a/b) or continuing the ingredient silhouettes onto the lower body (style c) — a subtle, tonal-on-tonal (barely-darker-than-the-block) line-art texture of the flavor's real ingredient (e.g. faint lime-slice illustrations within a solid lime-green block) is a valid, recurring way to add pattern to this bottom block even under style (a) or (b), not just style (c). A FLAT, PATTERN-LESS solid-color block is NEVER correct — every real can in this family has some visible pattern, using real flavor-relevant icon shapes or line-art, not just abstract lines alone.
+- DO NOT invent an unrelated design system — no embossed line-art motifs, no foil-stamped illustrations, no graphic device that doesn't already exist in the real reference family. The only things that change between flavors in this real system are: the accent color, the flavor name's font treatment, the top/bottom band intensity (minimal stripe vs. busy icon pattern), and the icons/texture used. Everything else in the structure above stays fixed.
+- ACCENT COLOR MUST BE REAL, VISIBLE PRODUCT COLOR: this brand has no single fixed "brand color" — verified directly against the real cans, each flavor gets its OWN distinct accent color (green for Vodka Limonade, yellow-green for Margarita, gold for Amaretto Sour, magenta/pink for Sangria Rouge, purple for Gin Limonade Petits Fruits) and there is no universal red requirement. What matters is that THIS flavor's chosen accent color is genuinely painted onto the product (band, text, pattern) — if you cropped the background out, the accent color should still clearly read on the can itself, not just appear as ambient background lighting reflected on an otherwise monochrome product.
+- BODY TREATMENT: the default, majority real pattern is a matte-black brushed-metal can body with the accent color confined to the top band, flavor name, and bottom chevron block — use this by default. A small minority of real flavors (a bold rum or sangria-style cocktail) instead use a full-color gradient body (the accent color washing the entire can, wordmark tinted to match) — only pick this minority treatment when the flavor is a similarly bold, fruit-forward cocktail character, not by default.
+- IF THIS IS A NON-ALCOHOLIC/MOCKTAIL VARIANT (flavor name mentions "SA", "sans alcool", "mocktail", or similar): use this brand's real, consistent mocktail formula — directly below the top pattern border and above the "CHERRY RIVER" wordmark, add ONE solid metallic silver/gray bar spanning the can's width reading "SANS ALCOOL" in bold black text; this is the ONLY extra element the mocktail variant adds. The word "MOCKTAIL" is NOT a separate bar, banner, or badge of its own — it is simply prepended directly onto the flavor name (e.g. "MOCKTAIL PALOMA"), rendered as ONE single flavor-name text block using the exact same accent-color display treatment from rule (4) above, in the exact same position and size a normal flavor name would occupy. Every other block (wordmark, category tag, bilingual description, specs line, tagline, bottom pattern block) keeps its normal position and treatment exactly as described above — do not stack, reorder, or add any additional band for "MOCKTAIL" beyond it being part of the flavor-name text. CRITICAL: the specs line on a mocktail/SA variant MUST read "0% alc./vol." — never any nonzero percentage, and never any alcohol category word (gin/vodka/rum/tequila/cocktail/wine/vin) anywhere on the can, since this is explicitly non-alcoholic; double-check this before finalizing. This same rule applies to the bilingual description text under rule (5): NEVER use an ingredient-based tagline that names an alcoholic base — including wine (e.g. "BOISSON À BASE DE TEQUILA ET LIME", or a Sangria description naming "VIN ROUGE"/"RED WINE") — on a mocktail/SA can, since that phrasing is exclusive to the alcoholic version of the flavor. For a mocktail/SA variant, either use the short 2-line flavor-only form (French flavor name / English flavor name, e.g. "MARGARITA" / "MARGARITA MOCKTAIL"), or if a longer descriptive tagline is used, describe only the fruit/flavor ingredients and never the alcoholic component (e.g. a Sangria mocktail should say "BOISSON À SAVEUR D'AGRUMES ET DE FRAISES" / "CITRUS AND STRAWBERRY FLAVOURED BEVERAGE" — dropping "de vin rouge"/"red wine" entirely).
+- MATERIAL FINISH (this is what makes the real cans look premium, not flat/painted): the can body must show a subtle brushed-aluminum metal texture — fine vertical brushed-metal striations catching the light, giving it a real tactile metallic surface, not a flat matte-painted look. The dark body area should read as dark metal with this brushed texture visible, not solid flat black.
+- TYPOGRAPHY POLISH: the flavor name and other display text must look bold, confident, and professionally finished — thick, well-kerned lettering with crisp clean edges and a subtle drop shadow or dark edge for depth/legibility against the metal body, exactly like a real finished can design, not thin or flat-looking text.
+- OPTIONAL DETAIL: for a relevant callout (e.g. "NON PÉTILLANTE", "SANS ALCOOL", or similar), a clean thin-bordered pill/badge outline around that text is a real recurring detail in this line — use it where it fits naturally.` : strictStyleNotesOnly ? `
+- FOLLOW THE STRUCTURE DESCRIBED IN "Brand visual identity" ABOVE EXACTLY — it is a precise, verified description of this brand's real, already-approved packaging for this specific product category, not a starting point for improvisation. Reproduce every named element (shape, cap, body treatment, label placement, illustration or lack of one, typography pairing, wording) as described.
+- DO NOT invent, add, or substitute any graphic device, illustration, foil stamp, badge, seal, or motif beyond what is explicitly named in the brand visual identity description above — if it doesn't mention an illustration, do not add one; if it says a treatment is absent (e.g. "NO illustration wrap"), that absence is a real, deliberate design fact, not a gap to fill in.
+- TYPOGRAPHY: keep the attached brand wordmark exactly as reference (never redraw it). For every other text element, match the exact structure and font pairing already described above.` : `
+- INVENT ONE DISTINCTIVE GRAPHIC CONCEPT FIRST (do this before anything else): a real packaging designer's job is to create ONE ownable visual device for this flavor — e.g. a custom line-art motif (a river current, a cherry branch silhouette, an abstract splash wave) foil-stamped or spot-gloss-printed behind the wordmark; a debossed/embossed texture; a duotone gradient with fine etched linework; a small circular badge or seal; a subtle pattern print. Pick ONE such device and build the whole label around it, finished with a premium technique (metallic foil, spot-gloss varnish over matte, or emboss) — not just flat white linework.
+- DO NOT default to "gradient background + a couple of photorealistic floating fruit + water droplets" as the design itself — that is a generic photography-prop trick, not packaging design, and must not be the ONLY visual idea on the can. Fruit/garnish props (if used at all) belong in the surrounding scene, not as the label's core graphic content.
+- TYPOGRAPHY: keep the attached brand wordmark exactly as reference (never redraw it). For every OTHER text element (flavor name, tagline, category tag), use real typographic craft and a deliberate pairing — e.g. a refined lighter-weight sans or a subtle serif for the tagline in contrast to the bold wordmark, considered letter-spacing, not just the same bold uppercase weight repeated for every line.`}
+- COLOR STORY: the brand's own core color(s) (see brand visual identity above) MUST be genuinely present as real, visible color IN the label design itself — never only as ambient background lighting or bokeh that fades to black-and-white on the actual product. A design that turns the product itself monochrome while only the surrounding scene carries the brand color is a FAIL — the can/bottle must be recognizably on-brand even with the background cropped out.
+- HIERARCHY: a clear top-to-bottom order, all blocks centered on ONE vertical axis with generous even spacing (never cramped or touching). Nothing may overlap or clutter any text block.
+- THIS IS A DESIGN CONCEPT MOCKUP FOR REVIEW/APPROVAL, NOT A MARKETING PHOTOGRAPH: show the product ALONE on a clean, plain, neutral studio background (solid white, or a soft seamless light-gray/black studio backdrop — matching exactly how this brand's own real catalog product photos are shot) — NO lifestyle props, NO scene, NO bokeh, NO environmental elements, NO garnish/ice/table surface of any kind. The only subject in frame is the can/bottle itself; the entire point is to evaluate the label/package design clearly, the same way the real reference photos present each product.
+- Composition: product centered, straight-on, front-facing, label fully legible edge-to-edge, even soft neutral studio lighting from the front/slightly above (no dramatic rim light, no color-graded shadows, no low hero angle) — a clean catalog/packshot framing, not a cinematic advertising angle.
+${designFeedback ? `- FIX THIS FROM THE PREVIOUS ATTEMPT (a design reviewer flagged it): ${designFeedback}\n` : ""}- Describe the label structure and the accent color/font choice for the flavor name in detail; keep the background/lighting description to one plain, brief line (e.g. "on a seamless white studio background, soft even front lighting") — under 140 words total.
+- You must ALWAYS return a valid image-generation prompt — never refuse, never ask a clarifying question.
+Return ONLY the final image prompt, nothing else. End with "clean studio product photography, plain neutral background, sharp focus throughout, professional catalog-style packaging shot, real brand logo clearly and accurately reproduced, market-ready packaging design mockup."`,
+    }],
+  });
+  const text = message.content[0].text.trim();
+  const looksLikeRefusal =
+    /^(i cannot|i can't|i need to|i'm unable|sorry,|unfortunately)/i.test(text) ||
+    /would you like me to|please (attach|provide|clarify)|let me know if/i.test(text) ||
+    text.includes("?");
+  if (looksLikeRefusal) {
+    throw new Error("Couldn't generate a valid brand concept from this input — try simplifying the flavor name.");
+  }
+  return text;
+}
+
+// Judges the label's graphic design craft specifically (typographic hierarchy, spacing,
+// clutter behind text) — separate from hasCorrectLogo, which only checks brand accuracy.
+// Feeds actionable feedback back into the next generation attempt, same backstop pattern.
+async function critiqueLabelDesign(imageUrl, brandName, styleNotes, matchRealFamily = false, referenceImages = []) {
+  const imgRes = await fetch(imageUrl);
+  const buf = Buffer.from(await imgRes.arrayBuffer());
+  const base64 = buf.toString("base64");
+  // Without seeing the brand's actual real cans, this critique has no ground truth and can
+  // only guess from generic design-principle assumptions — which previously caused it to
+  // wrongly flag genuinely real patterns (e.g. a real triangle+dot border variant) as
+  // "foreign to the brand" simply because they weren't spelled out in the text rules below.
+  // Attaching the same curated real reference photos used for generation lets it compare
+  // directly against real examples instead of guessing.
+  const refImages = matchRealFamily
+    ? await Promise.all(referenceImages.map(async (url) => {
+        const r = await fetch(url);
+        const mediaType = r.headers.get("content-type") || (url.endsWith(".png") ? "image/png" : "image/jpeg");
+        return { mediaType, base64: Buffer.from(await r.arrayBuffer()).toString("base64") };
+      }))
+    : [];
+  const message = await anthropic.messages.create({
+    model: "claude-opus-4-6",
+    max_tokens: 200,
+    messages: [{
+      role: "user",
+      content: [
+        ...refImages.map((img) => ({ type: "image", source: { type: "base64", media_type: img.mediaType, data: img.base64 } })),
+        { type: "image", source: { type: "base64", media_type: "image/png", data: base64 } },
+        { type: "text", text: `You are a senior packaging designer for premium beverage brands (the typographic caliber of White Claw, High Noon, Topo Chico). ${refImages.length ? `The FIRST ${refImages.length} images attached are REAL reference photos of ${brandName}'s actual existing product line — this is your ONLY ground truth for what's "on-brand" vs "foreign," not general assumptions about beverage packaging. The LAST image is the NEW candidate design to judge.` : "Judge the attached candidate design."} Judge ONLY the label's graphic design — NOT the photography lighting, props, or background scene.
+${styleNotes ? `\n${brandName}'s known brand visual identity: ${styleNotes}\n` : ""}
+Check specifically for:
+1. Typographic hierarchy, spacing/alignment, whether background imagery clutters or overlaps any text, contrast/legibility.
+${matchRealFamily
+  ? `2. Real family match: compare the candidate DIRECTLY against the attached real reference photos — does it plausibly belong to the same real product line? The real references themselves already show real variation (different border patterns, different flavor-name fonts, 2-line or 3-line category tags, short or longer bilingual taglines, different accent colors per flavor) — do NOT flag a candidate merely for differing from ONE specific reference photo if its choice is still clearly the same FAMILY of treatment (e.g. a different real geometric border style, or a different real font mood, or a different accent color) as what you see across the attached references. Only flag it if it invents a design system that matches NONE of the attached references' actual patterns (e.g. embossed illustrations, foil line-art, a badge/seal, or an ornate style nothing in the references shows). ALSO check the bottom diagonal color block: is there a visible pattern in it, matching the kind of pattern-density you see in the references? If icons are used: the real references show as many distinct icon types/colors as the flavor names ingredients (e.g. a real 3-fruit flavor shows 3 distinct icon types in 3 different true-to-life colors, not one hue family) — do NOT flag multiple distinct icon types as a failure when the flavor name itself lists multiple ingredients; only flag icons that don't correspond to any named ingredient, or icons scattered with no relation to the flavor at all. On rendering style: this brand's approved concept icons (already accepted and shipped, e.g. the regular Cosmo, Mojito, Tequila Paloma cans) DO show a small highlight dot on rounded fruit like a cranberry, and mild internal shading on a citrus slice — that normal level of flat-vector fruit-icon polish is CORRECT and must NOT be flagged. Only flag an icon if it is clearly full photographic or painterly rendering: strong dimensional 3D lighting with a visible light source and shadow side, camera depth-of-field blur, wet/juicy photographic texture, or airbrushed realism — i.e. something that looks like an actual photo of real fruit, not a slightly-polished flat vector icon. When in doubt, PASS it — this check has been too strict recently and wrongly rejected icons at the same normal polish level as already-approved cans.`
+  : `2. Distinctiveness: does the label have ONE real ownable graphic device (a custom line-art motif, texture, badge, pattern) — or is it just a generic gradient background with a couple of literal floating fruit photos and water droplets and nothing else? The latter is a FAIL even if the text is legible and well-spaced — that formula is generic stock photography, not packaging design.`}
+3. Typography variety: does the supporting text (flavor name, tagline) show real typographic craft/contrast, or is every line just the same bold uppercase weight repeated?
+4. Accent color fidelity: DO NOT flag a design for lacking "cherry-red" or any specific brand-signature color — this brand has NO fixed brand color requirement of any kind, confirmed directly from the real cans (Vodka Limonade is green, Margarita is yellow-green with zero red anywhere, Mocktail Paloma is dusty pink, Sangria Rouge is magenta, Gin Limonade Petits Fruits is purple — none of these show a red crimp, red band, or any red brand signature). Look again carefully at the attached reference images' actual colors before claiming red is expected — it is not. The only real check here is: does THIS flavor's own chosen accent color (whatever hue it picked) actually appear as real color ON the product itself, rather than the product going fully monochrome/grayscale with color only in the background lighting?
+
+Respond in EXACTLY this format:
+VERDICT: GOOD or NEEDS_WORK
+FEEDBACK: <if NEEDS_WORK: one short, specific, actionable instruction fixing the single biggest issue — naming a concrete graphic device or typographic change to make, not just "improve it". If GOOD, write NONE.>` },
+      ],
+    }],
+  });
+  const text = (message.content[0].text || "").trim();
+  const verdictMatch = text.match(/VERDICT:\s*(GOOD|NEEDS_WORK)/i);
+  const feedbackMatch = text.match(/FEEDBACK:\s*([\s\S]+)/i);
+  const good = verdictMatch ? verdictMatch[1].toUpperCase() === "GOOD" : true;
+  return { good, feedback: good ? "" : (feedbackMatch ? feedbackMatch[1].trim() : "") };
+}
+
+// conceptShapeReferenceImages (Concept Studio's generic per-format map) is Cherry-River-photo-based
+// for the bottle formats — wrong silhouette if a brand's real bottle looks different. Override per
+// brand+format here only where a REAL, CURRENT photo confirms the correct shape.
+const brandShapeReferenceImages = {
+  Averse: {
+    bottle114: conceptShapeReferenceImages.bottle114, // Averse Vodka Mangue 1.14L — real, current shape, already Averse-specific
+    // bottle750 intentionally NOT overridden: the catalog's stored Averse 750mL photo is a
+    // known-STALE bottle design (see project memory, Sep 12 2026 finding) — using it would teach
+    // the model the wrong, discontinued silhouette. Falls back to the generic bottle750 reference
+    // below until Francis supplies an updated Averse 750mL product photo.
+  },
+};
+
+// Cans (no fixed shape per flavor): several design ideas in one call, via number_of_images.
+// Bottles (shape "already programmed" per product line, per Francis): one accurate mockup
+// against the chosen bottle type's real shape reference.
+// Real Averse bottles carry a small "CHERRY RIVER" parent-brand credit near the base
+// (confirmed against 4 real product photos) — feed the actual parent logo file so it
+// gets copied faithfully instead of redrawn in a generic font (see hasParentBrandLogo below).
+const CHERRY_RIVER_LOGO_URL = "https://bypedtyxtnmmdsyrgwpj.supabase.co/storage/v1/object/public/product-images/brand-assets/cherry-river-logo.png";
+// Tight crops (no can shape, no wordmark) isolating just the real flat icon rendering itself —
+// fed as extra visual reference because text instructions alone repeatedly failed to stop the
+// model from adding glossy/dimensional shading to fruit icons (see generateBrandConcept).
+const ICON_STYLE_REFERENCE_LIME = "https://bypedtyxtnmmdsyrgwpj.supabase.co/storage/v1/object/public/product-images/brand-assets/icon-style-ref-lime.png";
+const ICON_STYLE_REFERENCE_BERRIES = "https://bypedtyxtnmmdsyrgwpj.supabase.co/storage/v1/object/public/product-images/brand-assets/icon-style-ref-berries.png";
+
+async function generateBrandConcept({ flavorName, productType, brandId, bottleShapeKey, variantCount, userId, userEmail }) {
+  const brand = await getBrand(brandId);
+  const shapeKey = productType === "can" ? "can" : bottleShapeKey;
+  const isUnverifiedAverseBottle750 = brand.name === "Averse" && shapeKey === "bottle750";
+  const crBottleCategory = brand.name === "Cherry River" && productType === "bottle" ? getCherryRiverBottleCategory(flavorName) : null;
+  const shapeDescriptor = (conceptShapeDescriptors[shapeKey] || conceptShapeDescriptors.can)
+    + (isUnverifiedAverseBottle750 ? " — the attached shape reference photo is Averse's 1.14L bottle: match its frosted matte glass material, dome-shaped clear base, and minimalist 'a|v|e|r|s|e' architectural label style exactly, but this concept is a STANDARD 750ml bottle — noticeably shorter and more compact than the 1.14L reference, ordinary spirit-bottle proportions (NOT the tall elongated 1.14L format, and NOT a Cherry River-style arched gin bottle)" : "")
+    + (crBottleCategory ? ` — ignore the generic description above; the exact real shape for this category is described in the "Brand visual identity" notes below, and the attached shape reference photo is a real ${crBottleCategory} bottle from this exact category — match its specific silhouette precisely, not a generic spirit-bottle shape.` : "");
+  // For the unverified Averse 750mL case, deliberately do NOT fall back to the generic
+  // bottle750 reference (a real Cherry River Dry Gin photo) — feeding a different brand's
+  // real product photo alongside the Averse logo as two reference images was corrupting the
+  // logo (model blending the two brands), causing every attempt to fail hasCorrectLogo. Using
+  // Averse's own 1.14L photo instead keeps the brand identity consistent; the height/proportion
+  // difference is corrected via the shapeDescriptor text above instead of a second image.
+  const shapeReferenceUrl = isUnverifiedAverseBottle750
+    ? conceptShapeReferenceImages.bottle114
+    : crBottleCategory
+    ? cherryRiverBottleShapeReferenceImages[crBottleCategory]
+    : (brandShapeReferenceImages[brand.name]?.[shapeKey] || conceptShapeReferenceImages[shapeKey] || conceptShapeReferenceImages.can);
+  const n = productType === "can" ? Math.min(variantCount || 4, 4) : 1;
+
+  // For cans, feed every real can this brand already sells as structure references instead of
+  // one generic shape photo — the model should adapt this brand's actual approved packaging
+  // system to the new flavor, not invent an unrelated design (see getBrandCanReferenceImages).
+  const brandCanReferenceImages = productType === "can" ? await getBrandCanReferenceImages(brand.id, brand.name) : [];
+  const hasParentBrandLogo = brand.name === "Averse";
+  const referenceImages = brandCanReferenceImages.length
+    ? [...brandCanReferenceImages, brand.logo_url]
+    : [shapeReferenceUrl, brand.logo_url];
+  if (hasParentBrandLogo) referenceImages.push(CHERRY_RIVER_LOGO_URL);
+  // Text alone repeatedly failed to stop the model from rendering glossy/dimensional fruit icons
+  // (5/5 failures across multiple prompt rewrites) — feeding tight crops of the real flat icon
+  // rendering itself (no can shape, no photographic context) as extra visual reference finally
+  // gives the model something concrete to copy instead of just a text description.
+  const includeIconStyleRefs = brand.name === "Cherry River" && productType === "can" && brandCanReferenceImages.length > 0;
+  if (includeIconStyleRefs) referenceImages.push(ICON_STYLE_REFERENCE_LIME, ICON_STYLE_REFERENCE_BERRIES);
+  // Cherry River's own real style_notes (audited from cans only) don't apply to bottles —
+  // e.g. "Don't bottle it!" never appears on a real CR bottle. Use the category-specific
+  // bottle description instead when we recognize the spirit category.
+  const effectiveStyleNotes = crBottleCategory ? cherryRiverBottleStyleNotesByCategory[crBottleCategory] : brand.style_notes;
+
+  // Verify every variant carries the correct logo AND that the label's graphic design (typography
+  // hierarchy, spacing, clutter) actually reads as professional — retry the whole batch on either
+  // failure, feeding the design reviewer's specific feedback into the next attempt's prompt, same
+  // backstop pattern as hasVisibleText/getFlatSilhouette above.
+  // The Vercel function has a 300s hard ceiling — with variantCount > 1, each retry (image gen +
+  // vision checks) takes long enough that 5 full attempts can exceed it, which kills the request
+  // and returns a non-JSON platform error page instead of our normal error response. Stop retrying
+  // with enough buffer left to return a proper JSON error instead of hitting that wall.
+  const startedAt = Date.now();
+  const TIME_BUDGET_MS = 250_000;
+  let replicateUrls, attempts = 0, allCorrect = false, designFeedback = null, enhancedPrompt;
+  while (attempts < MAX_CONCEPT_ATTEMPTS && !allCorrect && Date.now() - startedAt < TIME_BUDGET_MS) {
+    attempts++;
+    enhancedPrompt = await enhanceBrandConceptPrompt({ flavorName, brandName: brand.name, styleNotes: effectiveStyleNotes, shapeDescriptor, designFeedback, realCanReferenceCount: brandCanReferenceImages.length, hasParentBrandLogo, strictStyleNotesOnly: !!crBottleCategory, includeIconStyleRefs });
+    replicateUrls = await runImageModel({
+      prompt: enhancedPrompt,
+      inputImages: referenceImages,
+      aspectRatio: "4:5",
+      n,
+      model: "sunburst",
+    });
+    const [logoChecks, designCritique] = await Promise.all([
+      Promise.all(replicateUrls.map((url) => hasCorrectLogo(url, brand.name))),
+      critiqueLabelDesign(replicateUrls[0], brand.name, effectiveStyleNotes, brandCanReferenceImages.length > 0 || !!crBottleCategory, brandCanReferenceImages.length > 0 ? brandCanReferenceImages : (crBottleCategory ? [shapeReferenceUrl] : [])),
+    ]);
+    const logoOk = logoChecks.every(Boolean);
+    allCorrect = logoOk && designCritique.good;
+    if (!allCorrect) {
+      designFeedback = designCritique.feedback || designFeedback;
+      console.warn(`Brand concept attempt ${attempts}/${MAX_CONCEPT_ATTEMPTS} for "${flavorName}" — logoOk=${logoOk} designOk=${designCritique.good}${designCritique.feedback ? ` feedback="${designCritique.feedback}"` : ""}, retrying...`);
+    }
+  }
+  if (!allCorrect) {
+    throw new Error(`Generated ${MAX_CONCEPT_ATTEMPTS} attempts and the design still wasn't market-ready (logo accuracy or label design quality) — try again or simplify the flavor name.`);
+  }
+
+  const images = await Promise.all(
+    replicateUrls.map(async (url, i) => {
+      const filename = `brandconcept-${Date.now()}-${i}.png`;
+      try { return await saveGeneratedImage(url, filename); }
+      catch (e) { return url; }
+    })
+  );
+
+  const rows = images.map((url) => ({
+    id: Date.now().toString() + Math.random().toString(36).slice(2, 6),
+    url,
+    // Avoid "Brand Concept: Cherry River Cherry River Cola" when the flavor name already
+    // includes the brand name (a very likely pattern, per Francis's own example).
+    product: `Brand Concept: ${flavorName.toLowerCase().startsWith(brand.name.toLowerCase()) ? flavorName : `${brand.name} ${flavorName}`}`,
+    color: "#888888",
+    prompt: enhancedPrompt,
+    type: "image",
+    date: new Date().toISOString(),
+    user_id: userId,
+    user_email: userEmail,
+    cost_usd: Math.round(FLUX_COST_PER_IMAGE * attempts * 1000) / 1000,
+  }));
+  const { data: savedGenerations, error } = await insertGenerations(rows);
+  if (error) throw error;
+
+  return { images, enhancedPrompt, savedGenerations };
+}
+
+app.get("/api/brands", async (_req, res) => {
+  const { data: brands, error } = await supabase.from("brands").select("id, name, logo_url").order("name");
+  if (error) return res.status(500).json({ error: error.message });
+  const { data: products } = await supabase.from("products").select("brand_id, product_type");
+  const withTypes = brands.map((b) => ({
+    ...b,
+    // Which product types this brand actually has in the real catalog — drives which
+    // options (can / bottle) the UI offers per brand, instead of hardcoding all of them.
+    productTypes: [...new Set((products || []).filter((p) => p.brand_id === b.id).map((p) => p.product_type))],
+    // Bottle shape references the UI should flag as approximate rather than confirmed-accurate
+    // (see brandShapeReferenceImages comment above generateBrandConcept).
+    approximateBottleShapes: b.name === "Averse" ? ["bottle750"] : [],
+  }));
+  res.json(withTypes);
+});
+
+app.post("/api/generate-brand-concept", async (req, res) => {
+  const reqStart = Date.now();
+  console.log(`[brand-concept] request received: flavor="${req.body?.flavorName}" brand=${req.body?.brandId} productType=${req.body?.productType} variantCount=${req.body?.variantCount}`);
+  try {
+    const user = await getUser(req);
+    if (!user) return res.status(401).json({ error: "Unauthorized" });
+    const { flavorName, productType, brandId, bottleShapeKey, variantCount } = req.body;
+    if (!flavorName || !flavorName.trim()) return res.status(400).json({ success: false, error: "Flavor name is required" });
+    if (!brandId) return res.status(400).json({ success: false, error: "Brand is required" });
+    if (productType === "bottle" && !bottleShapeKey) return res.status(400).json({ success: false, error: "Bottle type is required" });
+
+    const { images, enhancedPrompt, savedGenerations } = await generateBrandConcept({
+      flavorName: flavorName.trim(),
+      productType: productType === "bottle" ? "bottle" : "can",
+      brandId, bottleShapeKey, variantCount,
+      userId: user.id, userEmail: user.email,
+    });
+
+    console.log(`[brand-concept] success in ${Date.now() - reqStart}ms`);
+    res.json({ success: true, images, enhancedPrompt, generations: savedGenerations });
+  } catch (error) {
+    console.error(`[brand-concept] error after ${Date.now() - reqStart}ms:`, error);
+    res.status(500).json({ success: false, error: error.message || "Failed to generate brand concept" });
+  }
+});
 
 app.post("/api/generate-concept-scene", async (req, res) => {
   try {
@@ -704,11 +1186,66 @@ app.post("/api/generate-concept-batch", async (req, res) => {
   }
 });
 
+// Averse's real bottle has THREE zones: opaque white neck/shoulder, clear glass mid-body
+// (visible liquid), and an OPAQUE, flavor-colored dome-shaped base/foot (confirmed against real
+// product photos, Sep 25 2026 — earlier this was wrongly treated as one continuous clear zone
+// all the way to the base, flagged as a real bug by Alyssa/Huzaifa; the base itself must stay
+// opaque, not see-through). This is the safety net: same pattern as hasVisibleText/hasCorrectLogo
+// elsewhere in this file.
+async function hasTransparentGlass(imageUrl, domeColor) {
+  const imgRes = await fetch(imageUrl);
+  const buf = Buffer.from(await imgRes.arrayBuffer());
+  const base64 = buf.toString("base64");
+  const message = await anthropic.messages.create({
+    model: "claude-opus-4-6",
+    max_tokens: 10,
+    messages: [{
+      role: "user",
+      content: [
+        { type: "image", source: { type: "base64", media_type: "image/png", data: base64 } },
+        { type: "text", text: `This bottle has three zones: (A) the very top neck/shoulder band carrying the "a|v|e|r|s|e" logo, (B) the mid-body starting at the "VODKA SUPÉRIEURE PREMIUM" text and ending where the bottle's flared foot/base begins, (C) the dome-shaped foot/base itself at the very bottom, which should be solid opaque ${domeColor || "white"} and narrower than the bottle's body, with a visible margin of clear glass around its left and right sides. Answer YES only if ALL of these are true: (1) zone B is genuinely clear, transparent, see-through glass — not opaque, solid white, frosted, or matte-colored, and the "VODKA SUPÉRIEURE PREMIUM" text reads as sitting directly on clear glass rather than on a white panel, (2) zone B's color/tone visibly reflects the actual background and lighting of the surrounding scene behind the bottle, rather than looking like a flat white, milky, or hazy cast that stays the same regardless of what's actually behind it, (3) zone C (the base/foot) is OPAQUE and solid-colored — NOT clear or see-through glass, and does NOT show the liquid or background through it, (4) zone C is CLEARLY narrower than the bottle body with clear glass visible on at least one side of it — only fail this specific point if the dome obviously fills the entire width edge-to-edge with zero visible glass margin on either side; if you're unsure or the margin is just small, treat this point as passing. If (1), (2), or (3) fail — zone B looks opaque/frosted/on-a-white-panel, OR zone B looks milky/white/hazy and disconnected from the real scene behind it, OR zone C looks clear/transparent/see-through instead of opaque — answer NO. Answer with exactly one word: YES or NO.` },
+      ],
+    }],
+  });
+  return (message.content[0].text || "").trim().toUpperCase().startsWith("YES");
+}
+
+// Any branded product with its own real reference photo can have its label text or graphics
+// hallucinated by the image model instead of copied faithfully — confirmed real bug (Francis,
+// Sep 25/26 2026): "Generate Image" produced a Cherry River Vodka Érable bottle with invented
+// garbled French copy ("AU-AARÔME NATUREL D'ÉRABLE" instead of the real "VODKA AROMATISÉE À
+// L'ÉRABLE") and a solid-filled maple leaf instead of the real skeletonized/vein-only foil style.
+// This is a general risk for every branded product with a reference photo, not just Averse (which
+// already has its own hasTransparentGlass safety net) — this check compares the generated label
+// directly against the real reference photo, the same verify+retry pattern used elsewhere in this
+// file, since prompt wording alone was already proven insufficient for Averse too.
+async function hasAccurateLabel(generatedUrl, referenceUrl) {
+  const [genRes, refRes] = await Promise.all([fetch(generatedUrl), fetch(referenceUrl)]);
+  const [genBuf, refBuf] = await Promise.all([genRes.arrayBuffer(), refRes.arrayBuffer()]);
+  const genContentType = genRes.headers.get("content-type") || "image/png";
+  const refContentType = refRes.headers.get("content-type") || "image/jpeg";
+  const message = await anthropic.messages.create({
+    model: "claude-opus-4-6",
+    max_tokens: 10,
+    messages: [{
+      role: "user",
+      content: [
+        { type: "text", text: "Image A is the REAL reference product photo. Image B is a newly generated marketing photo of the same product, in a different scene/background — ignore all scene/background/lighting differences and focus only on the product's own label area (text, wordmark, and any illustration/graphic device printed on it)." },
+        { type: "image", source: { type: "base64", media_type: refContentType, data: Buffer.from(refBuf).toString("base64") } },
+        { type: "image", source: { type: "base64", media_type: genContentType, data: Buffer.from(genBuf).toString("base64") } },
+        { type: "text", text: `Compare the label in image B against image A. Answer YES only if image B's label reasonably matches image A's real label: the same printed wording (no invented, garbled, mistranslated, or reworded text), and the same illustration/graphic style (e.g. a lace/skeletonized illustration must not become a solid-filled one, a line-art illustration must not become a bold graphic). Minor differences in camera angle, lighting, or crop are fine and should NOT cause a NO. Answer NO only if the label text or graphic style is clearly wrong or invented compared to image A. Answer with exactly one word: YES or NO.` },
+      ],
+    }],
+  });
+  return (message.content[0].text || "").trim().toUpperCase().startsWith("YES");
+}
+
 // Core image generation pipeline — used by /api/generate-image (existing marketing photography pipeline)
 async function generateProductImage({ product, productName, productColor, userPrompt, format, quality, quantity, userId, userEmail }) {
   const aspect_ratio = aspectRatioMap[format] || "1:1";
   const isCan = product && product.product_type === "can";
   const isAverseImg = product?.name?.toLowerCase().includes("averse");
+  const averseDomeColorImg = isAverseImg ? getAverseDomeColor(product?.name) : "";
 
   let enhancedPrompt;
   try {
@@ -721,32 +1258,27 @@ async function generateProductImage({ product, productName, productColor, userPr
   const canPrefix = isCan
     ? "tall slim 355ml cylindrical aluminum beverage can standing perfectly upright at 90 degrees, exact same can design and label as the reference image, label text sharp and undistorted, "
     : isAverseImg
-    ? "frosted matte white elongated spirit bottle standing perfectly upright, distinctive colored dome-shaped base cap, minimalist 'a|v|e|r|s|e' architectural label with pipe separators, Cherry River dome cap branding, label text sharp and undistorted, "
+    ? `frosted matte white elongated spirit bottle standing perfectly upright, distinctive colored dome-shaped base cap, minimalist 'a|v|e|r|s|e' architectural label with pipe separators, Cherry River dome cap branding, label text sharp and undistorted, the top neck/shoulder band carrying the 'a|v|e|r|s|e' logo is opaque frosted white — starting right at the 'VODKA SUPÉRIEURE PREMIUM' text the MID-BODY (down to where the bottle's flared foot/base begins) is genuine clear see-through glass: that text sits directly on the clear glass (not on a white backing), so the ribbed glass texture and the liquid inside are visible through it too, never opaque or frosted in the mid-body, this clear mid-body glass must show real optical refraction of the actual scene's background and lighting behind it, NEVER a flat white or milky haze carried over from a reference photo, the liquid itself is ${getAverseLiquidDescriptor(product?.name)} — never a different color, but the dome-shaped foot/base at the very bottom is a SEPARATE, OPAQUE, solid ${averseDomeColorImg}-colored section — NEVER clear or see-through glass, never showing the liquid or background through it — this dome is NARROWER than the bottle's body (about two-thirds of its width), centered at the very bottom with a visible margin of clear see-through glass wrapping around both its left and right sides, never spanning the bottle's full width, carrying the 'CHERRY RIVER' text and the '40% ALC. / VOL. 750 ml' line directly below it, both in solid black (not white or gray), sitting on that opaque ${averseDomeColorImg} surface, `
     : "";
   const prompt = canPrefix + enhancedPrompt;
 
-  const inputPayload = {
-    prompt,
-    resolution: "4 MP",
-    aspect_ratio,
-    output_format: "png",
-    output_quality: 100,
-    safety_tolerance: 5,
-    guidance: isCan ? 4 : 3,
-    prompt_upsampling: true,
-  };
-
-  if (product && product.image) {
-    inputPayload.input_images = [product.image];
-  }
-
+  const hasReferenceImage = !!(product && product.image);
+  const inputImages = hasReferenceImage ? [product.image] : [];
   const count = Math.min(quantity || 1, 4);
-  const promises = Array.from({ length: count }, () =>
-    replicate.run("black-forest-labs/flux-2-pro", { input: inputPayload })
-  );
-
-  const results = await Promise.all(promises);
-  const replicateUrls = results.map((output) => (output.url ? output.url() : String(output)));
+  let replicateUrls, glassOk = true, glassAttempts = 0;
+  do {
+    glassAttempts++;
+    replicateUrls = await runImageModel({ prompt, inputImages, aspectRatio: aspect_ratio, n: count, model: "flare" });
+    const checks = [];
+    if (isAverseImg) {
+      checks.push(...(await Promise.all(replicateUrls.map((u) => hasTransparentGlass(u, averseDomeColorImg)))));
+    }
+    if (hasReferenceImage) {
+      checks.push(...(await Promise.all(replicateUrls.map((u) => hasAccurateLabel(u, product.image)))));
+    }
+    glassOk = checks.every(Boolean);
+    if (!glassOk) console.warn(`Label/glass accuracy check failed on attempt ${glassAttempts}/3, retrying...`);
+  } while (hasReferenceImage && !glassOk && glassAttempts < 3);
 
   const images = await Promise.all(
     replicateUrls.map(async (url, i) => {
@@ -770,7 +1302,7 @@ async function generateProductImage({ product, productName, productColor, userPr
     date: new Date().toISOString(),
     user_id: userId,
     user_email: userEmail,
-    cost_usd: FLUX_COST_PER_IMAGE,
+    cost_usd: Math.round(FLUX_COST_PER_IMAGE * glassAttempts * 1000) / 1000,
   }));
 
   const { data: savedGenerations, error } = await insertGenerations(rows);
@@ -899,10 +1431,13 @@ app.post("/api/products", upload.single("image"), async (req, res) => {
 });
 
 app.post("/api/products/:id/image", upload.single("image"), async (req, res) => {
+  const userId = await getUserId(req);
+  if (!userId) return res.status(401).json({ error: "Unauthorized" });
   if (!req.file) return res.status(400).json({ error: "No image file provided" });
 
   const { data: product } = await supabase.from("products").select("*").eq("id", req.params.id).single();
   if (!product) return res.status(404).json({ error: "Product not found" });
+  if (product.user_id !== userId) return res.status(403).json({ error: "Forbidden" });
 
   // Delete old image from storage
   if (product.image && product.image.includes(BUCKET)) {
@@ -938,14 +1473,14 @@ app.delete("/api/products/:id", async (req, res) => {
   const { data: product } = await supabase.from("products").select("*").eq("id", req.params.id).single();
   if (!product) return res.status(404).json({ error: "Product not found" });
 
-  // Delete image from storage
+  const userId = await getUserId(req)
+  if (!userId || product.user_id !== userId) return res.status(403).json({ error: "Forbidden" })
+
+  // Delete image from storage (only after authorization passes)
   if (product.image && product.image.includes(BUCKET)) {
     const storagePath = product.image.split(`${BUCKET}/`)[1];
     await supabase.storage.from(BUCKET).remove([storagePath]);
   }
-
-  const userId = await getUserId(req)
-  if (!userId || product.user_id !== userId) return res.status(403).json({ error: "Forbidden" })
 
   const { error } = await supabase.from("products").delete().eq("id", req.params.id);
   if (error) return res.status(500).json({ error: error.message });
@@ -1050,6 +1585,7 @@ async function enhanceCollectionPrompt(products, userPrompt) {
   }
   const hasCans = products.some(p => p.product_type === "can")
   const hasBottles = products.some(p => p.product_type !== "can")
+  const averseProducts = products.filter(p => p.name?.toLowerCase().includes("averse"))
   const productNames = products.map(p => p.name).join(", ")
   userContent.push({
     type: "text",
@@ -1063,7 +1599,7 @@ Reference style: De Soi editorial — products at different heights on natural p
 ${userPrompt ? `Client direction: ${userPrompt}\n\n` : ""}COMPOSITION RULES:
 - Each product UPRIGHT at a DIFFERENT HEIGHT: upturned wine glass, textured glass block, stone slab, wooden board as risers
 - Every label facing camera, fully readable
-${hasCans ? "- Cans: perfectly vertical 90°, label undistorted\n" : ""}${hasBottles ? "- Bottles: upright, label sharp and clear\n" : ""}- Seasonal props scattered naturally: fresh fruits matching each flavor, botanical garnishes, flower petals
+${hasCans ? "- Cans: perfectly vertical 90°, label undistorted\n" : ""}${hasBottles ? "- Bottles: upright, label sharp and clear\n" : ""}${averseProducts.length ? `- CRITICAL for ${averseProducts.map(p => `"${p.name}" (liquid: ${getAverseLiquidDescriptor(p.name)}, base dome: ${getAverseDomeColor(p.name)})`).join(", ")}: the top neck/shoulder band carrying the "a|v|e|r|s|e" logo is opaque frosted white — starting right at the "VODKA SUPÉRIEURE PREMIUM" text (which sits directly on clear glass, not a white backing) the MID-BODY only, down to where the bottle's flared foot/base begins, MUST render as genuine clear, transparent, see-through glass revealing the ribbed glass texture and the liquid inside (in the exact color noted above, never a different one), and it must show real refraction of THIS scene's own background/lighting rather than a flat white or milky cast copied from a reference photo — BUT the dome-shaped foot/base itself, at the very bottom, is a SEPARATE, OPAQUE, solid-colored section (the exact base-dome color noted above per product) — NEVER clear or see-through glass, never showing the liquid or background through it — and is NARROWER than the bottle's body (about two-thirds of its width), centered at the very bottom with a visible margin of clear see-through glass wrapping around both its left and right sides, never spanning the bottle's full width — carrying the "CHERRY RIVER" text and the "40% ALC. / VOL. 750 ml" line directly below it, both in solid black, not white or gray, sitting on that opaque base surface, unlike the white wordmark higher up\n` : ""}- Seasonal props scattered naturally: fresh fruits matching each flavor, botanical garnishes, flower petals
 - Warm beige/clay background, soft directional natural light from left
 - Stone or concrete surface
 - Magazine lifestyle editorial quality, one hand reaching in from top (optional)
@@ -1094,21 +1630,23 @@ app.post("/api/generate-collection", async (req, res) => {
     const enhancedPrompt = await enhanceCollectionPrompt(products, userPrompt)
     const aspect_ratio = aspectRatioMap[format] || "1:1"
     const input_images = products.filter(p => p.image).map(p => p.image)
+    const averseProductInShot = products.find(p => p.name?.toLowerCase().includes("averse"))
+    const hasAverse = !!averseProductInShot
+    const averseDomeColorShot = hasAverse ? getAverseDomeColor(averseProductInShot.name) : ""
 
-    const inputPayload = {
-      prompt: enhancedPrompt,
-      resolution: "4 MP",
-      aspect_ratio,
-      output_format: "png",
-      output_quality: 100,
-      safety_tolerance: 5,
-      guidance: 3.5,
-      prompt_upsampling: true,
-    }
-    if (input_images.length > 0) inputPayload.input_images = input_images
-
-    const output = await replicate.run("black-forest-labs/flux-2-pro", { input: inputPayload })
-    const replicateUrl = output.url ? output.url() : String(output)
+    // Multiple real products composited into one scene — Sunburst's high-control editing
+    // handles multi-reference composition more reliably than the fast/everyday Flare model.
+    // Same Averse glass-transparency safety net as generateProductImage — the prompt rule
+    // alone isn't a guarantee, so verify + retry when an Averse product is in the shot.
+    let replicateUrl, glassOk = true, glassAttempts = 0;
+    do {
+      glassAttempts++;
+      [replicateUrl] = await runImageModel({ prompt: enhancedPrompt, inputImages: input_images, aspectRatio: aspect_ratio, model: "sunburst" })
+      if (hasAverse) {
+        glassOk = await hasTransparentGlass(replicateUrl, averseDomeColorShot);
+        if (!glassOk) console.warn(`Collection Shot Averse glass-transparency check failed on attempt ${glassAttempts}/3, retrying...`);
+      }
+    } while (hasAverse && !glassOk && glassAttempts < 3);
 
     const filename = `collection-${Date.now()}.png`
     let finalUrl
@@ -1126,7 +1664,7 @@ app.post("/api/generate-collection", async (req, res) => {
       date: new Date().toISOString(),
       user_id: user.id,
       user_email: user.email,
-      cost_usd: FLUX_COST_PER_IMAGE,
+      cost_usd: Math.round(FLUX_COST_PER_IMAGE * glassAttempts * 1000) / 1000,
     })
 
     res.json({ success: true, image: finalUrl, enhancedPrompt })
@@ -1167,20 +1705,7 @@ Rules:
     }
 
     const aspect_ratio = aspectRatioMap[format] || "1:1";
-    const output = await replicate.run("black-forest-labs/flux-2-pro", {
-      input: {
-        prompt: enhancedPrompt,
-        resolution: "4 MP",
-        aspect_ratio,
-        output_format: "png",
-        output_quality: 100,
-        safety_tolerance: 5,
-        guidance: 3.5,
-        prompt_upsampling: true,
-      },
-    });
-
-    const replicateUrl = output.url ? output.url() : String(output);
+    const [replicateUrl] = await runImageModel({ prompt: enhancedPrompt, aspectRatio: aspect_ratio, model: "flare" });
     const filename = `freescene-${Date.now()}.png`;
     let finalUrl;
     try { finalUrl = await saveGeneratedImage(replicateUrl, filename); }
@@ -1599,15 +2124,7 @@ async function enhanceVideoPrompt(userScene, product) {
   // Detect product type — can vs bottle
   const isCan = product.product_type === "can" || product.productType === "can" || productNameLower.includes("can");
   const isAverse = productNameLower.includes("averse");
-  const averseDomeColor = isAverse ? (
-    productNameLower.includes("pomme") || productNameLower.includes("apple") ? "apple green" :
-    productNameLower.includes("framboise") || productNameLower.includes("raspberry") ? "deep crimson red" :
-    productNameLower.includes("mangue") || productNameLower.includes("mango") ? "warm amber orange" :
-    productNameLower.includes("limonade") ? "lemon yellow" :
-    productNameLower.includes("basilic") || productNameLower.includes("petits fruits") ? "mauve purple" :
-    productNameLower.includes("gin") || productNameLower.includes("london") ? "midnight navy" :
-    "white"
-  ) : null;
+  const averseDomeColor = isAverse ? getAverseDomeColor(productNameLower) : null;
 
   // Can: resolve flavor preset (outdoor lifestyle), override colorWorld from preset
   const canPreset = isCan ? getCanPreset(product) : null;
