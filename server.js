@@ -2340,8 +2340,9 @@ app.post("/api/generate-video", async (req, res) => {
 
     const { data: product } = await supabase.from("products").select("*").eq("id", productId).maybeSingle();
     if (!product) return res.status(404).json({ error: "Product not found" });
+    if (product.user_id !== userId) return res.status(403).json({ error: "Forbidden" });
 
-    const dur = Math.min(Math.max(parseInt(duration) || 10, 4), 15);
+    const dur =Math.min(Math.max(parseInt(duration) || 10, 4), 15);
     const userScene = customPrompt?.trim() || "cinematic product reveal with dramatic lighting";
 
     let fullPrompt;
